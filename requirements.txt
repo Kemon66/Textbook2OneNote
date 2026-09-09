@@ -1,0 +1,4 @@
+pymupdf
+tkinterdnd2
+PyInstaller
+（内容由AI生成，仅供参考）
