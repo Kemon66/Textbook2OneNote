@@ -201,14 +201,22 @@ class App:
             return
         self._restore_btn()
         if r is None:
-            if not importer.has_text_layer(path):
-                self.log("该 PDF 未检测到文本层（扫描版/图片型），当前版本无法读取其目录。")
+            reason, stats = importer.diagnose_pdf(path)
+            if reason == "scanned":
+                self.log("检测到扫描版/图片型 PDF（无文字层），无法识别目录。")
+                self.log("文本层统计: 采样%d页 / 有实质文本%d页(%.1f%%) / 总字符%d / 单页文本中位数%d" %
+                         (stats["sampled"], stats["text_pages"], stats["ratio"] * 100,
+                          stats["text_chars"], stats["len_median"]))
                 messagebox.showwarning(
                     "无法识别",
-                    "该 PDF 为扫描版或图片型（无文字层），当前版本无法识别其目录。\n"
-                    "可提供带文字层的 PDF，或由开发端接入 OCR 后重打包。")
+                    "该 PDF 为扫描版/图片型（无文字层），无法识别其目录。\n"
+                    "请先对教材进行 OCR 处理，或更换带文字层的版本后重试。")
             else:
-                self.log("未识别到有效目录层级，无法继续")
+                self.log("检测到文字层，但前 40 页未定位到目录页（Contents/目录），无法自动识别章节层级。")
+                messagebox.showwarning(
+                    "无法识别",
+                    "PDF 含文字层但未找到目录页（Contents / 目录）。\n"
+                    "请确认教材包含目录页后重试，或更换含标准目录的版本。")
             return
         result, outdir = r
         if result.get("ok"):

@@ -206,20 +206,95 @@ def _page_num_at(tail):
     return int(m.group(1)) if m else None
 
 
+# 单页「有实质文本」的最小字符数：低于此视为无正文的空白/纯图页
+_TEXT_PAGE_MIN = 3
+
+
+def _sample_text_stats(doc, total, max_points=60):
+    """均匀采样透视全文，返回 (有实质文本的单页长度列表, 采样总字符数, 全部采样长度列表)。
+    采样点按间隔 max(1, total//max_points) 覆盖全文，最多 max_points 个，避免只看开篇几页。"""
+    if total <= 0:
+        return [], 0, []
+    if total <= max_points:
+        idxs = list(range(total))
+    else:
+        step = max(1, total // max_points)
+        idxs = list(range(0, total, step))[:max_points]
+    lens = []
+    for i in idxs:
+        lens.append(len(doc[i].get_text().strip()))
+    text_lens = [L for L in lens if L >= _TEXT_PAGE_MIN]
+    return text_lens, sum(lens), lens
+
+
+def analyze_text_layer(doc):
+    """分析 PDF 文本层（扫描版/图片型判定），返回统计 dict。
+
+    判定信号：
+      1) 内嵌 outline（get_toc）非空 → 文档带可检索大纲，必然有文本层；
+      2) 否则均匀采样透视全文，统计「有实质文本页」占比与单页文本长度分布：
+         扫描版（每页一张图、仅残留极少量 OCR 碎片）的典型特征是
+         文本页占比极低（< 0.3），或占比中等（< 0.6）但文本页中位数极短（< 20 字符）。
+         —— 避免「前几页任一页文本≥3字符就误判为有文本层」的粗判。
+    """
+    toc = doc.get_toc()
+    toc_count = len(toc) if toc else 0
+    total = doc.page_count
+    text_lens, text_chars, all_lens = _sample_text_stats(doc, total)
+    sampled = len(all_lens)
+    text_pages = len(text_lens)
+    ratio = round(text_pages / sampled, 3) if sampled else 0.0
+    len_median = sorted(text_lens)[len(text_lens) // 2] if text_lens else 0
+    len_max = max(text_lens) if text_lens else 0
+
+    is_scanned = True
+    if toc_count > 0:
+        is_scanned = False          # 带大纲 → 必然有文本层
+    elif text_pages == 0:
+        is_scanned = True           # 采样页中没有一个实质文本页
+    elif ratio >= 0.6:
+        is_scanned = False          # 绝大多数采样页都有实质文本 → 正常文本教材
+    elif ratio < 0.3:
+        is_scanned = True           # 文本页占比过低 → 每页一图、零星残片
+    else:
+        is_scanned = len_median < 20  # 占比中等但单页文本极短 → OCR 残片型扫描件
+
+    return {
+        "toc_count": toc_count,
+        "total_pages": total,
+        "sampled": sampled,
+        "text_pages": text_pages,
+        "ratio": ratio,
+        "text_chars": text_chars,
+        "len_median": len_median,
+        "len_max": len_max,
+        "is_scanned": is_scanned,
+    }
+
+
 def has_text_layer(path):
-    """粗略判断 PDF 是否有可提取的文本层（扫描版/图片型 PDF 为 False）。"""
+    """稳健判定 PDF 是否有可提取的文本层（扫描版/图片型 PDF 为 False）。
+    以 get_toc 大纲 + 全文多页采样统计为准，取代旧的「前 N 页任一页≥3字符」粗判。"""
     try:
-        import fitz
         doc = fitz.open(path)
         try:
-            for i in range(min(doc.page_count, 20)):
-                if len(doc[i].get_text().strip()) >= 3:
-                    return True
+            return not analyze_text_layer(doc)["is_scanned"]
         finally:
             doc.close()
     except Exception:
         return False
-    return False
+
+
+def diagnose_pdf(path):
+    """目录识别失败时给出原因分类（供 GUI 弹窗使用）。
+    返回 (reason, stats)：reason ∈ {'scanned', 'no_toc'}。"""
+    doc = fitz.open(path)
+    try:
+        stats = analyze_text_layer(doc)
+    finally:
+        doc.close()
+    reason = "scanned" if stats["is_scanned"] else "no_toc"
+    return reason, stats
 
 
 def parse_toc_pdf(doc, start, end):
@@ -929,7 +1004,16 @@ def process_pdf(path, out_root, notegen_exe):
     doc = fitz.open(path)
     start, end = detect_toc_pages_pdf(doc)
     if start is None:
-        log("未能定位目录页")
+        stats = analyze_text_layer(doc)
+        if stats["is_scanned"]:
+            log("检测到扫描版/图片型 PDF（无文字层），无法识别目录层级。")
+            log("文本层统计: 采样%d页 / 有实质文本%d页(%.1f%%) / 总字符%d / 单页文本中位数%d" %
+                (stats["sampled"], stats["text_pages"], stats["ratio"] * 100,
+                 stats["text_chars"], stats["len_median"]))
+            log("请先对教材进行 OCR 处理，或更换带文字层的版本后重试。")
+        else:
+            log("检测到文字层，但前 40 页未定位到目录页（Contents / 目录），无法自动识别章节层级。")
+            log("请确认教材包含目录页后重试，或更换含标准目录的版本。")
         return None
     entries = parse_toc_pdf(doc, start, end)
     n_part = sum(1 for e in entries if e["level"] == "part")
