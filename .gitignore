@@ -3,3 +3,6 @@ __pycache__/
 build/
 dist/
 *.log
+notegen.exe
+Textbook2OneNote_v2.0.1_backup.exe
+Textbook2OneNote.exe

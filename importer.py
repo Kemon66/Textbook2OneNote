@@ -12,11 +12,17 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import unicodedata
 
-import fitz  # PyMuPDF
+try:
+    import pymupdf as fitz  # PyMuPDF >= 1.24 推荐的新导入名
+except ImportError:
+    import fitz
 
 
 # ---------------------------------------------------------------------------
@@ -24,7 +30,41 @@ import fitz  # PyMuPDF
 # ---------------------------------------------------------------------------
 
 def log(msg):
-    print("[T2N]", msg, flush=True)
+    try:
+        print("[T2N]", msg, flush=True)
+    except Exception:
+        pass  # 打包为无控制台 exe 时 stdout 可能为 None
+
+
+class ImportCancelled(Exception):
+    """用户取消了当前操作。"""
+
+
+def _emit(log_cb, msg):
+    """输出一条日志：有 GUI 回调时走回调，否则打印到控制台。"""
+    if log_cb is not None:
+        log_cb(msg)
+    else:
+        log(msg)
+
+
+class _TextCache:
+    """按页缓存 PDF 文本与规范化 key，目录定位/删减整理时避免反复解析整页。"""
+
+    def __init__(self, doc):
+        self.doc = doc
+        self._text = {}
+        self._flat = {}
+
+    def text(self, page):
+        if page not in self._text:
+            self._text[page] = self.doc[page].get_text() or ""
+        return self._text[page]
+
+    def flat(self, page):
+        if page not in self._flat:
+            self._flat[page] = _title_key(self.text(page))
+        return self._flat[page]
 
 
 def pick_file():
@@ -59,9 +99,53 @@ def find_output_dir():
     return home
 
 
+_WIN_ILLEGAL_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def sanitize_book_name(name):
+    """清理书名：NFC 规范化、替换 Windows 非法字符、压缩空白并限制长度。"""
+    s = unicodedata.normalize("NFC", str(name or ""))
+    s = _WIN_ILLEGAL_NAME.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip(" .")
+    return s[:120].strip() or "未命名笔记本"
+
+
+def derive_book_name(path, doc=None):
+    """确定笔记本（输出文件夹）名：优先文档元数据中的书名，回退到文件名。
+
+    PDF 用内嵌元数据 title，Word 用文档属性 title；元数据缺失或是
+    "Untitled / Microsoft Word - / PowerPoint" 之类占位值时回退文件名。
+    """
+    stem = sanitize_book_name(os.path.splitext(os.path.basename(path))[0])
+    ext = os.path.splitext(path)[1].lower()
+    title = ""
+    if ext == ".pdf" and doc is not None:
+        try:
+            title = sanitize_book_name((doc.metadata or {}).get("title"))
+        except Exception:
+            title = ""
+    elif ext == ".docx":
+        try:
+            import docx as _docx
+            d = _docx.Document(path)
+            title = sanitize_book_name(d.core_properties.title)
+        except Exception:
+            title = ""
+    low = title.lower()
+    if low.startswith("microsoft word - "):
+        title = sanitize_book_name(title[len("microsoft word - "):])
+    elif not title or low in ("untitled", "title", "pdf", "document",
+                              "无标题", "新建"):
+        title = stem
+    return title or stem or "未命名笔记本"
+
+
 def this_dir():
     """返回本脚本/可执行文件所在目录（用于定位 notegen.exe）。"""
     if getattr(sys, "frozen", False):
+        mp = getattr(sys, "_MEIPASS", "")
+        if mp and os.path.exists(os.path.join(mp, "notegen.exe")):
+            return mp
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
@@ -82,7 +166,7 @@ def detect_toc_pages_pdf(doc):
             brief = i
         # 正文目录页：英文 Contents / 中文「目 录」
         is_contents = (re.search(r"\bContents\b", t, re.I)
-                       or re.search("目[\s\xa0]*录", t))
+                       or re.search(r"目[\s\xa0]*录", t))
         if is_contents and not re.search(r"Brief[\s\xa0]+(Table[\s\xa0]+of[\s\xa0]+)?Contents", t, re.I):
             contents.append(i)
     if brief is not None:
@@ -328,25 +412,34 @@ def parse_toc_pdf(doc, start, end):
                 buf += " " + seg
                 j += 1
             t = re.sub(r"\s+", " ", buf).strip()
-            mm = re.match(r"^PART\s+([IVXLCivxlcd]+|\d+)\s*(.*)$", t, re.I)
+            # 行尾 1-3 位数字若落在页数范围内，视为页码；识别标题时先剥离，
+            # 未知行则保留原始文本（含页码）交给普通行逻辑处理。
+            sp0 = _page_num_at(t)
+            t_clean = t
+            if sp0 is not None and 1 <= sp0 <= doc.page_count:
+                t_clean = t[: t.rfind(str(sp0))].strip()
+            mm = re.match(r"^PART\s+([IVXLCivxlcd]+|\d+)\s*(.*)$", t_clean, re.I)
             if mm:
                 entries.append({"level": "part", "num": mm.group(1).upper(),
                                 "name": mm.group(2).strip(), "print": 0})
             else:
-                cm = re.match(r"^CHAPTER\s+(\d+)\s*(.*)$", t, re.I)
+                cm = re.match(r"^CHAPTER\s+(\d+)\s*(.*)$", t_clean, re.I)
                 if cm:
                     entries.append({"level": "chapter", "num": cm.group(1),
-                                    "name": cm.group(2).strip(), "print": tpage or 0})
+                                    "name": cm.group(2).strip(),
+                                    "print": tpage or sp0 or 0})
                 else:
-                    cm2 = re.match(r"^(\d{1,3})\s*[>.:]\s*(.+)$", t)
+                    cm2 = re.match(r"^(\d{1,3})\s*[>.:]\s*(.+)$", t_clean)
                     if cm2 and int(cm2.group(1)) <= 200:
                         entries.append({"level": "chapter", "num": cm2.group(1),
-                                        "name": cm2.group(2).strip(), "print": tpage or 0})
+                                        "name": cm2.group(2).strip(),
+                                        "print": tpage or sp0 or 0})
                     else:
-                        mm2 = re.match(r"^(\d{1,3})\s{1,}([A-Z0-9][^0-9].*)$", t)
+                        mm2 = re.match(r"^(\d{1,3})\s{1,}([A-Z0-9][^0-9].*)$", t_clean)
                         if mm2 and int(mm2.group(1)) <= 200:
                             entries.append({"level": "chapter", "num": mm2.group(1),
-                                            "name": mm2.group(2).strip(), "print": tpage or 0})
+                                            "name": mm2.group(2).strip(),
+                                            "print": tpage or sp0 or 0})
                         else:  # 未知大字号行，按普通行继续处理（保留 pending，不重置）
                             fs = 8.0
                             text = t
@@ -537,15 +630,20 @@ def _parse_toc_text(doc, start, end):
     return entries
 
 
-def calc_offset_pdf(doc, entries, toc_end):
+def calc_offset_pdf(doc, entries, toc_end, cancel=None):
     """锚定法 + 众数：用主节/章节标题在正文中定位，排除离群值求最稳 offset。"""
     scored = [(e, e["print"]) for e in entries
               if e["level"] in ("main", "chapter") and e["print"] is not None
               and e["name"] and len(e["name"].split()) >= 4]
+    cache = _TextCache(doc)
     offsets = []
     for e, pr in scored[:60]:
+        if cancel is not None and cancel.is_set():
+            raise ImportCancelled()
         lo = max(toc_end + 1, pr - 1)
-        abs_p = _locate_title_page(doc, e["name"], lo, doc.page_count)
+        # offset 只接受 0..160，因此只需在 pr-1..pr+160 窗口内搜索，避免扫到书尾
+        hi = min(doc.page_count, pr + 161)
+        abs_p = _locate_title_page(doc, e["name"], lo, hi, cache=cache, cancel=cancel)
         if abs_p is None:
             continue
         off = abs_p - pr
@@ -570,32 +668,35 @@ def _title_key(title):
     return re.sub(r"[^a-z0-9%$]+", "", title.lower())
 
 
-def _locate_title_page(doc, title, lo, hi):
+def _locate_title_page(doc, title, lo, hi, cache=None, cancel=None):
     """在正文 [lo,hi) 页范围内定位完整标题首次出现的绝对页（忽略空白/大小写）。
     标题可能跨行，故用压缩空白后的全文匹配。找不到返回 None。"""
     key = _title_key(title)
     if len(key) < 12:
         return None
-    for i in range(lo, min(hi, doc.page_count)):
-        text = doc[i].get_text()
-        if not text:
-            continue
-        flat = _title_key(text)
-        if key in flat:
+    cache = cache or _TextCache(doc)
+    for i in range(max(0, lo), min(hi, doc.page_count)):
+        if cancel is not None and cancel.is_set():
+            raise ImportCancelled()
+        if key in cache.flat(i):
             return i
     return None
 
 
-def fill_missing_pages(doc, entries, toc_end, offset):
+def fill_missing_pages(doc, entries, toc_end, offset, cancel=None):
     """对 print 为 None 的 main，用正文标题搜索回填其印刷页码。
     找不到的按上一主节+1 近似，仍覆盖不到则用 chapter 起始。"""
+    cache = _TextCache(doc)
     last_abs = None          # 上一主节已定位的正文绝对页，用于推进搜索下界
     for e in entries:
+        if cancel is not None and cancel.is_set():
+            raise ImportCancelled()
         if e["level"] == "chapter":
             # 章节有页码时顺带锚定 last_abs，保证主节搜索从章节正文页起步
             if e["print"] is not None:
                 lo = max(toc_end + 1, e["print"] - 1 if last_abs is None else last_abs - 1)
-                ap = _locate_title_page(doc, e["name"], lo, doc.page_count)
+                ap = _locate_title_page(doc, e["name"], lo, doc.page_count,
+                                        cache=cache, cancel=cancel)
                 if ap is not None:
                     last_abs = ap
             continue
@@ -603,14 +704,16 @@ def fill_missing_pages(doc, entries, toc_end, offset):
             continue
         if e["print"] is not None and last_abs is None:
             lo = max(toc_end + 1, e["print"] - 1)
-            ap = _locate_title_page(doc, e["name"], lo, doc.page_count)
+            ap = _locate_title_page(doc, e["name"], lo, doc.page_count,
+                                    cache=cache, cancel=cancel)
             if ap is not None:
                 last_abs = ap
             continue
         if e["print"] is not None:
             continue
         lo = max(toc_end + 1, (last_abs + 1) if last_abs is not None else toc_end + 1)
-        ap = _locate_title_page(doc, e["name"], lo, doc.page_count)
+        ap = _locate_title_page(doc, e["name"], lo, doc.page_count,
+                                cache=cache, cancel=cancel)
         if ap is not None:
             e["print"] = ap - offset if offset is not None else ap
             last_abs = ap
@@ -828,16 +931,16 @@ def _consecutive(pages):
     return out
 
 
-def _page_lines(doc, p, n=6):
+def _page_lines(doc, p, n=6, cache=None):
     """取页面文本的前 n 个非空行使于里程碑检测。"""
-    txt = (doc[p].get_text() or "").strip()
+    txt = (cache.text(p) if cache is not None else (doc[p].get_text() or "")).strip()
     lines = [l.strip() for l in txt.splitlines() if l.strip()]
     return lines[:n]
 
 
-def _milestone_page_kind(doc, p):
+def _milestone_page_kind(doc, p, cache=None):
     """书尾独立部分起始页探测：前几行命中独立标题词 -> (kind)或 None。"""
-    for line in _page_lines(doc, p, 6):
+    for line in _page_lines(doc, p, 6, cache=cache):
         low = line.lower()
         for kind, kws in _LO_MILESTONES:
             for kw in kws:
@@ -852,7 +955,7 @@ def _milestone_page_kind(doc, p):
     return None
 
 
-def _region_kind(doc, pages, toc_start, toc_end):
+def _region_kind(doc, pages, toc_start, toc_end, cache=None):
     """对一段删减页整体归类：逐页关键词加权后按众数取 kind。
     避免单页中"Brief Contents 列出附录条目"之类的噪声词主导整段。
     """
@@ -861,7 +964,7 @@ def _region_kind(doc, pages, toc_start, toc_end):
         return "toc"
     votes = {}
     for p in pages:
-        text = (doc[p].get_text() or "").lower()
+        text = (cache.text(p) if cache is not None else (doc[p].get_text() or "")).lower()
         scores = {}
         for kind, kws in _LO_KW.items():
             s = sum(text.count(k) for k in kws)
@@ -877,7 +980,7 @@ def _region_kind(doc, pages, toc_start, toc_end):
     return max(votes, key=votes.get) if votes else "other"
 
 
-def classify_leftovers(doc, toc_start, toc_end, covered):
+def classify_leftovers(doc, toc_start, toc_end, covered, cache=None, cancel=None):
     """识别未被目录覆盖的 PDF 页并按语义归类为删减分区。
 
     只处理两类明确区域，避免正文页因页码偏移被误当删减内容：
@@ -886,6 +989,7 @@ def classify_leftovers(doc, toc_start, toc_end, covered):
     正文中间散布的未覆盖页属"目录覆盖缺口"，不纳入删减分区（单独计数报告）。
     返回 [{"kind": str, "pages": [abs...]}]，每 kind 只会出现一次（跨区间合并）。
     """
+    cache = cache or _TextCache(doc)
     total = doc.page_count
     uncov = sorted(set(range(total)) - set(covered))
     first_cov = min(covered) if covered else total
@@ -899,20 +1003,24 @@ def classify_leftovers(doc, toc_start, toc_end, covered):
     # ---- 书首区：目录区间优先，其余按连续片断逐段归类 ----
     toc_set = set()
     for rg in _consecutive(head_pages):
+        if cancel is not None and cancel.is_set():
+            raise ImportCancelled()
         sub_toc = [p for p in rg if toc_start <= p <= toc_end]
         if sub_toc:
             groups.append(("toc", sub_toc))
         sub_rest = [p for p in rg if p not in sub_toc]
         for seg in _consecutive(sub_rest):
-            groups.append((_region_kind(doc, seg, toc_start, toc_end), seg))
+            groups.append((_region_kind(doc, seg, toc_start, toc_end, cache=cache), seg))
     # ---- 书尾区：里程碑切段，无里程碑段按关键词归并 ----
     for rg in _consecutive(tail_pages):
         seg_kind, seg_pages, pending = None, [], []
         for p in rg:
-            mk = _milestone_page_kind(doc, p)
+            if cancel is not None and cancel.is_set():
+                raise ImportCancelled()
+            mk = _milestone_page_kind(doc, p, cache=cache)
             if mk is not None:
                 if pending:                       # 里程碑前积累的无标签页
-                    groups.append((_region_kind(doc, pending, toc_start, toc_end), pending))
+                    groups.append((_region_kind(doc, pending, toc_start, toc_end, cache=cache), pending))
                     pending = []
                 if seg_kind is not None and seg_kind != mk:
                     groups.append((seg_kind, seg_pages))
@@ -924,7 +1032,7 @@ def classify_leftovers(doc, toc_start, toc_end, covered):
             else:
                 pending.append(p)
         if pending:
-            groups.append((_region_kind(doc, pending, toc_start, toc_end), pending))
+            groups.append((_region_kind(doc, pending, toc_start, toc_end, cache=cache), pending))
         if seg_kind is not None:
             groups.append((seg_kind, seg_pages))
     # ---- 同 kind 合并：仅页号仍连续才合并，避免书首/书尾不相干片段被硬拼 ----
@@ -971,21 +1079,32 @@ def add_leftover_part(plan, leftovers):
 # 渲染 & 生成
 # ---------------------------------------------------------------------------
 
-def render_pdf(doc, abs_pages, outdir):
+def render_pdf(doc, abs_pages, outdir, cancel=None, progress=None):
     os.makedirs(outdir, exist_ok=True)
+    pages = sorted(abs_pages)
+    total = len(pages)
+    if progress:
+        progress("渲染页面", 0, total)
     n = 0
-    for ap in sorted(abs_pages):
+    for idx, ap in enumerate(pages, 1):
+        if cancel is not None and cancel.is_set():
+            raise ImportCancelled()
         png = os.path.join(outdir, "page_%04d.png" % ap)
         if os.path.exists(png):
             continue
         doc[ap].get_pixmap(dpi=150).save(png)
         n += 1
+        if progress:
+            progress("渲染页面", idx, total)
     return n
 
 
 def run_notegen(exe, plan_path, rendered, outdir, name):
+    if not os.path.isfile(exe):
+        raise FileNotFoundError("未找到 OneNote 生成引擎 notegen.exe：%s" % exe)
     cmd = [exe, plan_path, rendered, outdir, name]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=1800)
     for line in r.stdout.splitlines():
         line = line.strip()
         if line.startswith("RESULT "):
@@ -997,104 +1116,278 @@ def run_notegen(exe, plan_path, rendered, outdir, name):
 
 
 # ---------------------------------------------------------------------------
+# 分析 / 预览（不渲染、不生成 OneNote 文件）
+# ---------------------------------------------------------------------------
+
+def _collect_abs_pages(plan):
+    """汇总 plan 中全部待渲染的绝对页号。"""
+    all_abs = set()
+    for part in plan.get("parts", []):
+        for ch in part.get("chapters", []):
+            for m in ch.get("mains", []):
+                all_abs.update(m.get("abs_pages") or [])
+            all_abs.update(ch.get("ends_abs_pages") or [])
+    return all_abs
+
+
+def _build_preview_tree(entries, counts=None):
+    """把 entries 转成 GUI 预览用的嵌套树；counts 为 Word 主节段落数映射。"""
+    counts = counts or {}
+    tree = []
+    cur_part = cur_ch = None
+    for e in entries:
+        lv = e["level"]
+        if lv == "part":
+            cur_part = {"level": "part", "num": e.get("num", ""), "name": e.get("name", ""),
+                        "print": e.get("print"), "children": []}
+            tree.append(cur_part)
+            cur_ch = None
+        elif lv == "chapter":
+            if cur_part is None:
+                cur_part = {"level": "part", "num": "0", "name": "Contents",
+                            "print": None, "children": []}
+                tree.append(cur_part)
+            cur_ch = {"level": "chapter", "num": e.get("num", ""), "name": e.get("name", ""),
+                      "print": e.get("print"), "children": []}
+            cur_part["children"].append(cur_ch)
+        elif lv in ("main", "end"):
+            if cur_ch is None:
+                if cur_part is None:
+                    cur_part = {"level": "part", "num": "0", "name": "Contents",
+                                "print": None, "children": []}
+                    tree.append(cur_part)
+                cur_ch = {"level": "chapter", "num": "0", "name": "",
+                          "print": None, "children": []}
+                cur_part["children"].append(cur_ch)
+            node = {"level": lv, "num": e.get("num", ""), "name": e.get("name", ""),
+                    "print": e.get("print")}
+            if lv == "main" and counts:
+                node["count"] = min(len(counts.get(e.get("num", ""), [])), 200)
+            cur_ch["children"].append(node)
+    return tree
+
+
+def analyze_file(path, cancel=None, progress=None, log_cb=None):
+    """预览/预分析入口：识别目录层级并返回结构树与生成计划，不渲染不写 OneNote。
+
+    成功返回 ok=True 并附带 plan；失败返回 ok=False 且带 reason：
+    scanned / no_toc / empty_toc（PDF），no_headings / doc_legacy（Word），
+    unsupported（其他扩展名）。
+    """
+    path = os.path.abspath(path)
+    name = sanitize_book_name(os.path.splitext(os.path.basename(path))[0])
+    size = os.path.getsize(path) if os.path.exists(path) else 0
+    ext = os.path.splitext(path)[1].lower()
+
+    def _tick(stage, done=0, total=0):
+        if progress:
+            progress(stage, done, total)
+
+    if ext == ".pdf":
+        doc = fitz.open(path)
+        try:
+            name = derive_book_name(path, doc=doc)
+            _tick("检测目录页")
+            start, end = detect_toc_pages_pdf(doc)
+            stats = analyze_text_layer(doc)
+            if start is None:
+                reason = "scanned" if stats["is_scanned"] else "no_toc"
+                return {"ok": False, "kind": "pdf", "reason": reason, "name": name,
+                        "path": path, "size": size, "pages": stats["total_pages"],
+                        "stats": stats, "toc_pages": None}
+
+            _tick("解析目录条目")
+            entries = parse_toc_pdf(doc, start, end)
+            n_part = sum(1 for e in entries if e["level"] == "part")
+            n_ch = sum(1 for e in entries if e["level"] == "chapter")
+            n_main = sum(1 for e in entries if e["level"] == "main")
+            n_end = sum(1 for e in entries if e["level"] == "end")
+            if n_ch == 0 and n_main == 0:
+                return {"ok": False, "kind": "pdf", "reason": "empty_toc", "name": name,
+                        "path": path, "size": size, "pages": stats["total_pages"],
+                        "stats": stats, "toc_pages": [start, end]}
+
+            _tick("计算页码偏移")
+            offset = calc_offset_pdf(doc, entries, end, cancel=cancel)
+            if offset is None:
+                _emit(log_cb, "偏移计算失败，回退 0")
+                offset = 0
+            _emit(log_cb, "页码偏移 offset=%d (abs = print + offset)" % offset)
+
+            n_missing = sum(1 for e in entries if e["level"] == "main" and e["print"] is None)
+            if n_missing:
+                _emit(log_cb, "正文定位回填 %d 个无页码主节..." % n_missing)
+                fill_missing_pages(doc, entries, end, offset, cancel=cancel)
+                still = sum(1 for e in entries if e["level"] == "main" and e["print"] is None)
+                _emit(log_cb, "回填后仍缺 %d" % still)
+
+            _tick("生成目录结构")
+            plan = build_plan(entries, offset)
+            all_abs = _collect_abs_pages(plan)
+
+            _tick("整理删减内容")
+            leftovers, n_lo, n_mid = classify_leftovers(doc, start, end, all_abs,
+                                                        cancel=cancel)
+            lo_chapters = []
+            if n_lo:
+                lo_chapters, _lo_pages = add_leftover_part(plan, leftovers)
+                plan["leftover"] = {"name": LO_PART_NAME, "chapters": lo_chapters}
+
+            leftovers_info = [{"kind": g["kind"],
+                               "name": LO_CAT_NAMES.get(g["kind"], LO_CAT_NAMES["other"]),
+                               "pages": g["pages"]} for g in leftovers]
+            render_pages = len(_collect_abs_pages(plan))
+            return {
+                "ok": True, "kind": "pdf", "name": name, "path": path, "size": size,
+                "pages": stats["total_pages"], "toc_pages": [start, end],
+                "stats": stats, "offset": offset, "plan": plan,
+                "counts": {"parts": n_part, "chapters": n_ch, "mains": n_main,
+                           "ends": n_end},
+                "tree": _build_preview_tree(entries),
+                "covered_pages": len(all_abs), "render_pages": render_pages,
+                "leftovers": leftovers_info, "gap_pages": n_mid,
+            }
+        finally:
+            doc.close()
+
+    if ext in (".docx", ".doc"):
+        if ext == ".doc":
+            return {"ok": False, "kind": "word", "reason": "doc_legacy",
+                    "name": name, "path": path, "size": size}
+        try:
+            name = derive_book_name(path)
+            entries, texts = parse_docx(path)
+        except Exception as e:
+            return {"ok": False, "kind": "word", "reason": "parse_error",
+                    "name": name, "path": path, "size": size, "error": str(e)}
+        plan = build_plan_word(entries, texts)
+        counts = {
+            "parts": sum(1 for e in entries if e["level"] == "part"),
+            "chapters": sum(1 for e in entries if e["level"] == "chapter"),
+            "mains": sum(1 for e in entries if e["level"] == "main"),
+        }
+        if counts["chapters"] == 0 and counts["mains"] == 0:
+            return {"ok": False, "kind": "word", "reason": "no_headings",
+                    "name": name, "path": path, "size": size}
+        return {
+            "ok": True, "kind": "word", "name": name, "path": path, "size": size,
+            "counts": counts, "plan": plan,
+            "tree": _build_preview_tree(entries, counts=texts),
+        }
+
+    return {"ok": False, "kind": None, "reason": "unsupported",
+            "name": name, "path": path, "size": size}
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
-def process_pdf(path, out_root, notegen_exe):
-    doc = fitz.open(path)
-    start, end = detect_toc_pages_pdf(doc)
-    if start is None:
-        stats = analyze_text_layer(doc)
-        if stats["is_scanned"]:
-            log("检测到扫描版/图片型 PDF（无文字层），无法识别目录层级。")
-            log("文本层统计: 采样%d页 / 有实质文本%d页(%.1f%%) / 总字符%d / 单页文本中位数%d" %
-                (stats["sampled"], stats["text_pages"], stats["ratio"] * 100,
-                 stats["text_chars"], stats["len_median"]))
-            log("请先对教材进行 OCR 处理，或更换带文字层的版本后重试。")
+def process_pdf(path, out_root, notegen_exe, cancel=None, progress=None,
+                log_cb=None, analysis=None):
+    """PDF 主流程：识别目录 → 渲染页面 → 生成 .one 笔记本。
+
+    analysis 为 analyze_file 的返回（预览后直接导入时复用，避免重复解析）；
+    为 None 时内部先分析。返回 (result, outdir)，无法识别时返回 None。
+    """
+    if analysis is None:
+        analysis = analyze_file(path, cancel=cancel, progress=progress, log_cb=log_cb)
+
+    if not analysis.get("ok"):
+        reason = analysis.get("reason")
+        stats = analysis.get("stats") or {}
+        if reason == "scanned":
+            _emit(log_cb, "检测到扫描版/图片型 PDF（无文字层），无法识别目录层级。")
+            _emit(log_cb, "文本层统计: 采样%d页 / 有实质文本%d页(%.1f%%) / 总字符%d / 单页文本中位数%d" %
+                  (stats.get("sampled", 0), stats.get("text_pages", 0),
+                   stats.get("ratio", 0) * 100, stats.get("text_chars", 0),
+                   stats.get("len_median", 0)))
+            _emit(log_cb, "请先对教材进行 OCR 处理，或更换带文字层的版本后重试。")
+        elif reason == "empty_toc":
+            _emit(log_cb, "目录页已找到，但未能解析出任何章节条目，无法继续。")
         else:
-            log("检测到文字层，但前 40 页未定位到目录页（Contents / 目录），无法自动识别章节层级。")
-            log("请确认教材包含目录页后重试，或更换含标准目录的版本。")
-        return None
-    entries = parse_toc_pdf(doc, start, end)
-    n_part = sum(1 for e in entries if e["level"] == "part")
-    n_ch = sum(1 for e in entries if e["level"] == "chapter")
-    n_main = sum(1 for e in entries if e["level"] == "main")
-    log("目录识别: %d PART / %d CHAPTER / %d 主节 (目录页 %d-%d)" % (n_part, n_ch, n_main, start, end))
-    if n_ch == 0 and n_main == 0:
-        log("目录解析结果为空，无法继续")
+            _emit(log_cb, "检测到文字层，但前 40 页未定位到目录页（Contents/目录），无法自动识别章节层级。")
+            _emit(log_cb, "请确认教材包含目录页后重试，或更换含标准目录的版本。")
         return None
 
-    offset = calc_offset_pdf(doc, entries, end)
-    if offset is None:
-        log("偏移计算失败，回退 0")
-        offset = 0
-    log("页码偏移 offset=%d (abs = print + offset)" % offset)
-
-    # 回填无页码主节（纯正文标题搜索定位）
-    n_missing = sum(1 for e in entries if e["level"] == "main" and e["print"] is None)
-    if n_missing:
-        log("正文定位回填 %d 个无页码主节..." % n_missing)
-        fill_missing_pages(doc, entries, end, offset)
-        still = sum(1 for e in entries if e["level"] == "main" and e["print"] is None)
-        log("回填后仍缺 %d" % still)
-
-    plan = build_plan(entries, offset)
-    all_abs = set()
-    for part in plan["parts"]:
-        for ch in part["chapters"]:
-            for m in ch["mains"]:
-                all_abs.update(m.get("abs_pages", []))
-            all_abs.update(ch.get("ends_abs_pages", []))
-
-    # --- 删减内容整理：未被目录覆盖的页自动归类为 前言/目录/附录/索引/后记 等分区 ---
-    leftovers, n_lo, n_mid = classify_leftovers(doc, start, end, all_abs)
-    if n_mid:
-        log("删减内容整理: 正文中另有 %d 页未被目录覆盖（目录覆盖缺口，不并入删减分区）" % n_mid)
-    if n_lo:
-        lo_chapters, lo_pages = add_leftover_part(plan, leftovers)
-        all_abs.update(lo_pages)
-        detail = ", ".join("%s(%d页)" % (LO_CAT_NAMES.get(g["kind"], "其他内容"), len(g["pages"]))
-                           for g in leftovers)
-        log("删减内容整理: 新增分区组「%s」, 共 %d 个分区 [%s]" % (LO_PART_NAME, n_lo, detail))
-        plan["leftover"] = {"name": LO_PART_NAME, "chapters": lo_chapters}
+    counts = analysis.get("counts", {})
+    toc_pages = analysis.get("toc_pages")
+    if toc_pages:
+        _emit(log_cb, "目录识别: %d PART / %d CHAPTER / %d 主节 (目录页 %d-%d)" %
+              (counts.get("parts", 0), counts.get("chapters", 0),
+               counts.get("mains", 0), toc_pages[0], toc_pages[1]))
+    leftovers = analysis.get("leftovers") or []
+    if leftovers:
+        detail = ", ".join("%s(%d页)" % (g["name"], len(g["pages"])) for g in leftovers)
+        _emit(log_cb, "删减内容整理: 新增分区组「%s」, 共 %d 个分区 [%s]" %
+              (LO_PART_NAME, len(leftovers), detail))
     else:
-        log("删减内容整理: 未发现被删减的页")
+        _emit(log_cb, "删减内容整理: 未发现被删减的页")
+    if analysis.get("gap_pages"):
+        _emit(log_cb, "删减内容整理: 正文中另有 %d 页未被目录覆盖（目录覆盖缺口，不并入删减分区）" %
+              analysis["gap_pages"])
 
-    name = os.path.splitext(os.path.basename(path))[0]
+    plan = analysis["plan"]
+    name = sanitize_book_name(analysis.get("name"))
     outdir = os.path.join(out_root, name)
     work = tempfile.mkdtemp(prefix="t2n_")
-    rendered = os.path.join(work, "rendered")
-    plan_path = os.path.join(work, "plan.json")
-    with open(plan_path, "w", encoding="utf-8") as f:
-        json.dump(plan, f, ensure_ascii=False)
+    doc = fitz.open(path)
+    try:
+        rendered = os.path.join(work, "rendered")
+        plan_path = os.path.join(work, "plan.json")
+        with open(plan_path, "w", encoding="utf-8") as f:
+            json.dump(plan, f, ensure_ascii=False)
 
-    log("渲染 %d 页 ..." % len(all_abs))
-    render_pdf(doc, all_abs, rendered)
-    doc.close()
+        all_abs = _collect_abs_pages(plan)
+        _emit(log_cb, "渲染 %d 页 ..." % len(all_abs))
+        render_pdf(doc, all_abs, rendered, cancel=cancel, progress=progress)
+        if cancel is not None and cancel.is_set():
+            raise ImportCancelled()
 
-    log("生成 .one 笔记本 ...")
-    result = run_notegen(notegen_exe, plan_path, rendered, outdir, name)
+        _emit(log_cb, "生成 .one 笔记本 ...")
+        result = run_notegen(notegen_exe, plan_path, rendered, outdir, name)
+    finally:
+        doc.close()
+        shutil.rmtree(work, ignore_errors=True)
     return result, outdir
 
 
-def process_word(path, out_root, notegen_exe):
-    entries, texts = parse_docx(path)
-    plan = build_plan_word(entries, texts)
-    n_ch = sum(1 for e in entries if e["level"] == "chapter")
-    n_main = sum(1 for e in entries if e["level"] == "main")
-    log("Word 目录识别: %d CHAPTER / %d 主节" % (n_ch, n_main))
-    if n_ch == 0 and n_main == 0:
-        log("未识别到标题层级，请确认文档使用了 Heading 样式")
+def process_word(path, out_root, notegen_exe, cancel=None, progress=None,
+                 log_cb=None, analysis=None):
+    """Word 主流程：识别标题层级 → 生成 .one 笔记本。
+
+    analysis 为 analyze_file 的返回；为 None 时内部先分析。返回 (result, outdir)，
+    无法识别时返回 None。
+    """
+    if analysis is None:
+        analysis = analyze_file(path, cancel=cancel, progress=progress, log_cb=log_cb)
+
+    if not analysis.get("ok"):
+        reason = analysis.get("reason")
+        if reason == "doc_legacy":
+            _emit(log_cb, "暂不支持旧版 .doc 格式，请用 Word 另存为 .docx 后重试。")
+        elif reason == "parse_error":
+            _emit(log_cb, "Word 文档解析失败: %s" % analysis.get("error"))
+        else:
+            _emit(log_cb, "未识别到标题层级，请确认文档使用了 Heading 1/2/3 样式")
         return None
 
-    name = os.path.splitext(os.path.basename(path))[0]
+    counts = analysis["counts"]
+    _emit(log_cb, "Word 目录识别: %d PART / %d CHAPTER / %d 主节" %
+          (counts["parts"], counts["chapters"], counts["mains"]))
+
+    name = sanitize_book_name(analysis.get("name"))
     outdir = os.path.join(out_root, name)
     work = tempfile.mkdtemp(prefix="t2n_")
-    plan_path = os.path.join(work, "plan.json")
-    with open(plan_path, "w", encoding="utf-8") as f:
-        json.dump(plan, f, ensure_ascii=False)
-
-    result = run_notegen(notegen_exe, plan_path, work, outdir, name)
+    try:
+        if cancel is not None and cancel.is_set():
+            raise ImportCancelled()
+        plan_path = os.path.join(work, "plan.json")
+        with open(plan_path, "w", encoding="utf-8") as f:
+            json.dump(analysis["plan"], f, ensure_ascii=False)
+        result = run_notegen(notegen_exe, plan_path, work, outdir, name)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     return result, outdir
 
 
@@ -1119,12 +1412,22 @@ def main():
     log("输出目录: %s" % out_root)
 
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".pdf":
-        r = process_pdf(path, out_root, notegen_exe)
-    elif ext in (".docx", ".doc"):
-        r = process_word(path, out_root, notegen_exe)
-    else:
-        log("不支持的文件类型: %s" % ext)
+    try:
+        if ext == ".pdf":
+            r = process_pdf(path, out_root, notegen_exe)
+        elif ext in (".docx", ".doc"):
+            r = process_word(path, out_root, notegen_exe)
+        else:
+            log("不支持的文件类型: %s" % ext)
+            return 1
+    except ImportCancelled:
+        log("已取消")
+        return 130
+    except FileNotFoundError as e:
+        log("✗ %s" % e)
+        return 2
+    except Exception as e:
+        log("✗ 处理失败: %s" % e)
         return 1
 
     if r is None:
@@ -1137,7 +1440,10 @@ def main():
         log("结构: %d 分区组 / %d 分区 / %d 页" %
             (result.get("groups", 0), result.get("sections", 0), result.get("pages", 0)))
         log("排序校验: %s" % ("通过" if result.get("sortedOk") else "失败"))
-        print("SUCCESS " + json.dumps({"out": outdir, **result}, ensure_ascii=False))
+        try:
+            print("SUCCESS " + json.dumps({"out": outdir, **result}, ensure_ascii=False))
+        except Exception:
+            pass
         return 0
     else:
         log("✗ 生成失败: %s" % result.get("error"))
